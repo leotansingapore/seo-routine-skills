@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/you</string>
+		<key>LOGNAME</key>
+		<string>leo</string>
+		<key>USER</key>
+		<string>leo</string>
+	</dict>
+	<key>Label</key>
+	<string>com.leo.og-cards-weekly</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/you/.local/bin/og-cards-weekly.sh</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/you/.local/share/og-cards/launchd.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/you/.local/share/og-cards/launchd.out.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>10</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+		<key>Weekday</key>
+		<integer>1</integer>
+	</dict>
+</dict>
+</plist>

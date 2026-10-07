@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Wait for Vercel's git build of a pushed commit to reach production.
+
+For git-connected projects a push to main IS the deploy; running `vercel --prod` as well
+builds the same commit twice. Weekly content flows call this after `git push` instead.
+
+  vercel-await-git-deploy <project> <commit-sha> [--timeout 600] [--scope leotansingapores-projects]
+
+Exit codes:
+  0  a production deployment for that commit is READY
+  1  it failed (ERROR), or it was CANCELED and no live deployment contains it: fix or push again,
+     do not redeploy the same commit. A CANCELED build that a newer live commit contains exits 0.
+  2  Vercel never built it (BLOCKED, e.g. the commit author has no Vercel access, or no
+     deployment appeared before the timeout): the caller may run `vercel --prod --yes` ONCE
+"""
+import json
+import subprocess
+import sys
+import time
+
+
+def production_deploys(project, scope):
+    out = subprocess.run(["vercel", "ls", project, "--prod", "--format", "json", "--scope", scope],
+                         capture_output=True, text=True, timeout=90)
+    try:
+        return json.loads(out.stdout).get("deployments", [])
+    except ValueError:
+        return []
+
+
+def live_contains(project, scope, sha, deadline):
+    while time.time() < deadline:
+        ready = [d for d in production_deploys(project, scope) if (d.get("state") or d.get("readyState")) == "READY"]
+        live = ((ready[0].get("meta") or {}).get("githubCommitSha") if ready else "") or ""
+        if live:
+            subprocess.run(["git", "fetch", "-q", "origin"], capture_output=True, timeout=300)
+            if subprocess.run(["git", "merge-base", "--is-ancestor", sha, live], capture_output=True).returncode == 0:
+                print("vercel %s %s: superseded, live %s contains it" % (project, sha[:8], live[:8]), flush=True)
+                return True
+        time.sleep(30)
+    return False
+
+
+def main(argv):
+    args, opts, i = [], {}, 0
+    while i < len(argv):
+        if argv[i].startswith("--") and i + 1 < len(argv):
+            opts[argv[i]] = argv[i + 1]
+            i += 2
+        else:
+            args.append(argv[i])
+            i += 1
+    if len(args) < 2:
+        print(__doc__)
+        return 2
+    project, sha = args[0], args[1]
+    timeout = int(opts.get("--timeout", 600))
+    scope = opts.get("--scope", "leotansingapores-projects")
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        for d in production_deploys(project, scope):
+            if (d.get("meta") or {}).get("githubCommitSha", "").startswith(sha):
+                state = d.get("state") or d.get("readyState")
+                if state != last:
+                    print("vercel %s %s: %s (%s)" % (project, sha[:8], state, d.get("url")), flush=True)
+                    last = state
+                if state == "READY":
+                    return 0
+                if state == "ERROR":
+                    return 1
+                if state == "CANCELED":
+                    # usually a newer push superseded it; fine if the live commit contains this one
+                    return 0 if live_contains(project, scope, sha, deadline) else 1
+                if state == "BLOCKED":
+                    return 2
+                break
+        time.sleep(15)
+    print("vercel %s %s: no production deployment after %ss" % (project, sha[:8], timeout), flush=True)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

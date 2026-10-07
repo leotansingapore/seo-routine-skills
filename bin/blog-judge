@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""blog-judge: would the reader rather land on our post or the competitor post it was built from?
+
+Usage: blog-judge <our-url> <competitor-url> --reader "who is searching" [--query "what they typed"] [--json]
+
+Jev (jev-1.13.0, pinned) reads both articles' main text in the reader's shoes and answers:
+  prefer      choice  ours / theirs / about_equal   (p_ours is what the weekly run gates on)
+  answers     noul    ours answers the reader's question in its first screen
+  gap         noul    theirs covers something the reader needs that ours leaves out
+Each pair is judged twice with the articles swapped and p_ours averaged, because position moved some
+verdicts (0.83 -> 0.55 on one Immigration post). Calibrated 2026-10-03 on 17 shipped posts (all 0.55-1.00)
+and off-topic/thin controls (0.00).
+Exit 0 = holds (p_ours >= 0.65), 3 = near miss (0.5-0.65: one improvement pass on `gap`),
+1 = loses (< 0.5: do not ship), 2 = could not fetch or judge.
+Built 2026-10-03 for the weekly-builds reader review (Leo: "go"). Text is capped per article
+because very large requests come back 503/529.
+"""
+import json, os, re, sys, time, urllib.request, argparse
+
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
+MODEL = "jev-1.13.0"
+CAP_WORDS = 2500
+
+
+def key():
+    k = os.environ.get("TYPESAFE_API_KEY")
+    if not k:
+        m = re.search(r"TYPESAFE_API_KEY=['\"]?([^'\"\s]+)", open(os.path.expanduser("~/.zshenv")).read())
+        k = m.group(1) if m else None
+    return k
+
+
+def main_text(url):
+    if os.path.isfile(url):   # an unpublished draft: judge it before it ships
+        raw = open(url, encoding="utf-8").read()
+        if url.endswith((".html", ".htm")):
+            raw = re.sub(r"<(script|style)[\s\S]*?</\1>|<[^>]+>", " ", raw)
+        words = re.sub(r"\s+", " ", raw).split()
+        m = re.search(r"<h1[^>]*>(.*?)</h1>", open(url, encoding="utf-8").read(), re.S)
+        title = re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else os.path.basename(url)
+        return title, " ".join(words[:CAP_WORDS])
+    from scrapling.fetchers import Fetcher
+    p = Fetcher.get(url, impersonate="chrome", timeout=30)
+    if p.status >= 400:
+        raise RuntimeError("%s answered %s" % (url, p.status))
+    for sel in ("article", "main", ".entry-content", ".post-content", "body"):
+        nodes = p.css(sel)
+        if not nodes:
+            continue
+        node = max(nodes, key=lambda n: len(n.get_all_text(strip=True)))
+        for junk in node.css("nav, header, footer, aside, script, style, form, .share, .related, .comments"):
+            try:
+                junk.remove()
+            except Exception:
+                pass
+        text = re.sub(r"\s+", " ", node.get_all_text(separator=" ", strip=True)).strip()
+        if len(text.split()) > 150:
+            title = (p.css("h1::text").get() or p.css("title::text").get() or "").strip()
+            return title, " ".join(text.split()[:CAP_WORDS])
+    raise RuntimeError("no article text at %s" % url)
+
+
+def judge(ours, theirs, reader, query, k):
+    state = {"reader": reader, "query": query,
+             "our_article": {"title": ours[0], "text": ours[1]},
+             "competitor_article": {"title": theirs[0], "text": theirs[1]}}
+    q = {
+        "prefer": {"type": "choice", "instructions": (
+            "Read both articles as `reader`, who searched for `query`. Which one would they rather have landed on? "
+            "Judge what helps them act: a direct answer, correct and specific facts for Singapore, steps or numbers "
+            "they can use, and nothing padded. Ignore which site it is on and how it looks."),
+            "criteria": {"ours": "`our_article` serves this reader clearly better.",
+                         "theirs": "`competitor_article` serves this reader clearly better.",
+                         "about_equal": "Neither is clearly better for this reader."}},
+        "answers": {"type": "noul", "instructions": (
+            "Does `our_article` give `reader` a direct answer to `query` in its opening paragraphs, before "
+            "background or scene-setting?"),
+            "criteria": {"true": "The answer is in the first few paragraphs.",
+                         "false": "The reader has to dig or never gets a direct answer."}},
+        "gap": {"type": "noul", "instructions": (
+            "Does `competitor_article` cover something `reader` needs for `query` (a fact, step, option, cost or "
+            "warning) that `our_article` leaves out entirely?"),
+            "criteria": {"true": "There is a needed point only the competitor covers.",
+                         "false": "Ours covers everything the reader needs that the competitor does."}},
+    }
+    body = json.dumps({"model": MODEL, "state": state, "questions": q}).encode()
+    req = urllib.request.Request(JEV_URL, data=body, headers={
+        "Authorization": "Bearer %s" % k, "Content-Type": "application/json"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return json.load(r)["answers"]
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503, 529) and attempt < 2:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
+
+
+def probs(ans):
+    d = ans.get("distribution") or ans.get("probabilities") or {}
+    if isinstance(d, list):
+        d = {x.get("option") or x.get("value"): x.get("probability") for x in d}
+    return {k: float(v) for k, v in d.items()}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ours"); ap.add_argument("theirs")
+    ap.add_argument("--reader", required=True); ap.add_argument("--query")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    k = key()
+    if not k:
+        print("blog-judge: no TYPESAFE_API_KEY"); sys.exit(2)
+    try:
+        ours, theirs = main_text(a.ours), main_text(a.theirs)
+        query = a.query or ours[0]
+        ans = judge(ours, theirs, a.reader, query, k)
+        swp = judge(theirs, ours, a.reader, query, k)   # ours sits in competitor_article here
+    except Exception as e:
+        print("blog-judge: %s" % e); sys.exit(2)
+    p, q = probs(ans["prefer"]), probs(swp["prefer"])
+    p = {"ours": (p.get("ours", 0) + q.get("theirs", 0)) / 2, "theirs": (p.get("theirs", 0) + q.get("ours", 0)) / 2,
+         "about_equal": (p.get("about_equal", 0) + q.get("about_equal", 0)) / 2}
+    out = {"ours": a.ours, "theirs": a.theirs, "pick": ans["prefer"].get("value") or ans["prefer"].get("choice"),
+           "p_ours": round(p.get("ours", 0), 3), "p_theirs": round(p.get("theirs", 0), 3),
+           "p_equal": round(p.get("about_equal", 0), 3),
+           "answers_early": round(float(ans["answers"]["noul"]), 3), "gap": round(float(ans["gap"]["noul"]), 3),
+           "words": [len(ours[1].split()), len(theirs[1].split())]}
+    if a.json:
+        print(json.dumps(out))
+    else:
+        print("%s  ours %.2f  theirs %.2f  equal %.2f  answers-early %.2f  gap %.2f  (%d vs %d words)" % (
+            "HOLDS" if out["p_ours"] >= 0.65 else "NEAR MISS" if out["p_ours"] >= 0.5 else "LOSES", out["p_ours"], out["p_theirs"],
+            out["p_equal"], out["answers_early"], out["gap"], out["words"][0], out["words"][1]))
+    sys.exit(0 if out["p_ours"] >= 0.65 else 3 if out["p_ours"] >= 0.5 else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Monthly Google Maps check for the businesses in ~/.local/share/local-maps-watch/config.json (built 2026-10-06).
+Per business: a 3x3 Maps rank grid per keyword, the Business Profile, and the newest 20 reviews, all through the
+local OpenSEO MCP (http://localhost:3001/mcp, DataForSEO underneath, ~$0.06 a business). Posts one card to the
+site's Lark group (hooks come from seo-visibility's config) and flags what only the owner can fix: a profile
+website that is not the site, and low reviews with no owner reply. History in history.jsonl beside the config.
+  local-maps-watch [--dry-run] [--only SLUG] [--selftest]"""
+import datetime, json, os, subprocess, sys, time, urllib.request
+
+D = os.path.expanduser('~/.local/share/local-maps-watch')
+STATE = os.path.expanduser('~/.local/state/local-maps-watch')
+MCP = 'http://localhost:3001/mcp'
+HOOKS = os.path.expanduser('~/.local/share/seo-visibility/config.json')
+
+
+def call(name, args, timeout=300):
+    body = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': name, 'arguments': args}}
+    req = urllib.request.Request(MCP, data=json.dumps(body).encode(), headers={
+        'content-type': 'application/json', 'accept': 'application/json,text/event-stream', 'MCP-Protocol-Version': '2025-06-18'})
+    d = json.load(urllib.request.urlopen(req, timeout=timeout))
+    if 'error' in d:
+        raise RuntimeError('%s: %s' % (name, d['error']))
+    r = d['result']
+    if r.get('isError'):
+        raise RuntimeError('%s: %s' % (name, r['content'][0]['text'][:300]))
+    return r.get('structuredContent') or {}
+
+
+def reviews(b):
+    args = {'projectId': b['project_id'], 'cid': b['cid'], 'depth': 20}
+    r = call('get_business_reviews', args)
+    for _ in range(4):  # queued job: resuming with the taskId is free
+        if r.get('status') != 'processing':
+            break
+        time.sleep(45)
+        r = call('get_business_reviews', dict(args, taskId=r['taskId']))
+    rows = next((v for v in r.values() if isinstance(v, list)), [])
+    return r.get('totals') or {}, rows
+
+
+def actions(site_domain, profile, rows, today, low=3, window_days=120):
+    """What only the owner can fix. Pure, so --selftest can hold it."""
+    out = []
+    dom = (profile.get('domain') or '').lower()
+    dom = dom[4:] if dom.startswith('www.') else dom
+    if dom != site_domain:
+        out.append('Profile website is %s, not %s. Change it in Google Business Profile.' % (dom or 'empty', site_domain))
+    if profile.get('is_claimed') is False:
+        out.append('The profile is not claimed. Claim it so you can reply and edit it.')
+    cutoff = today - datetime.timedelta(days=window_days)
+    bad = [r for r in rows if (r.get('rating') or {}).get('value', 5) <= low and not r.get('owner_answer')
+           and datetime.date.fromisoformat(r['timestamp'][:10]) >= cutoff]
+    if bad:
+        out.append('%d review%s of %d stars or less in the last %d days with no reply:' % (len(bad), '' if len(bad) == 1 else 's', low, window_days))
+        out += ['  %s, %d star%s: "%s"' % (r['timestamp'][:10], r['rating']['value'], '' if r['rating']['value'] == 1 else 's', ' '.join((r.get('review_text') or '').split())[:90]) for r in bad]
+    return out
+
+
+def grid_line(kw, g, prev):
+    s = g['summary']
+    centre = next((p for p in g['grid'] if p['row'] == p['col'] == 1), {})
+    line = '%s: in the top 3 at %d of %d points, found at %d, average rank %s; #1 at the office: %s' % (
+        kw, s['top3Count'], s['pointsSearched'], s['pointsFound'], s.get('averageRank') or '-',
+        (centre.get('topResult') or {}).get('title') or '-')
+    if prev:
+        d = s['top3Count'] - prev['top3Count']
+        if d:
+            line += ' (%s%d top-3 points since %s)' % ('+' if d > 0 else '', d, prev['date'])
+    return line
+
+
+MD_ESCAPE = {'<': '&#60;', '>': '&#62;', '*': '&#42;', '_': '&#95;', '~': '&#126;', '[': '&#91;', ']': '&#93;', '`': '&#96;', '#': '&#35;', '&': '&#38;'}
+
+
+def md(t):
+    return ''.join(MD_ESCAPE.get(c, c) for c in t or '')
+
+
+def card(b, lines, acts, link):
+    n = 1 if acts else 0
+    header = {'title': {'tag': 'plain_text', 'content': '%s - Google Maps check' % b['name']},
+              'subtitle': {'tag': 'plain_text', 'content': b['site_domain']},
+              'template': 'yellow' if n else 'green',
+              'text_tag_list': [{'tag': 'text_tag', 'color': 'yellow' if n else 'green',
+                                 'text': {'tag': 'plain_text', 'content': 'Action: Leo' if n else 'No action'}}]}
+    els = [{'tag': 'markdown', 'content': '\n'.join(md(l) for l in lines)}]
+    if acts:
+        els.append({'tag': 'markdown', 'content': '**Needs Leo**\n' + '\n'.join(md(a) for a in acts)})
+    els.append({'tag': 'markdown', 'content': '[Open the profile on Google Maps](%s)' % link})
+    return {'schema': '2.0', 'config': {'summary': {'content': b['name']}}, 'header': header,
+            'body': {'direction': 'vertical', 'padding': '12px 12px 20px 12px', 'vertical_spacing': '12px', 'elements': els}}
+
+
+def post(hook, payload):
+    try:
+        req = urllib.request.Request(hook, data=json.dumps(payload, ensure_ascii=True).encode(), headers={'Content-Type': 'application/json'})
+        resp = json.loads(urllib.request.urlopen(req, timeout=20).read().decode() or '{}')
+        return resp.get('code', resp.get('StatusCode', 0)) in (0, None)
+    except Exception as e:
+        print('lark error:', e, file=sys.stderr)
+        return False
+
+
+def run(b, cfg, prev, dry):
+    today = datetime.date.today()
+    profile = call('get_business_profile', {'projectId': b['project_id'], 'cid': b['cid']}).get('profile') or {}
+    totals, rows = reviews(b)
+    grids = {}
+    for kw in b['keywords']:
+        grids[kw] = call('get_local_rank_grid', {'projectId': b['project_id'], 'keyword': kw, 'target': {'cid': b['cid'], 'name': b['name']},
+                                                 'center': b['center'], 'gridSize': cfg['grid']['size'], 'spacingKm': cfg['grid']['spacing_km']})
+    rating, count = (totals.get('rating') or {}).get('value'), totals.get('reviews_count')
+    line = 'Rating %s from %s reviews' % (rating, count)
+    if prev and prev.get('reviews') is not None and count is not None and count != prev['reviews']:
+        line += ' (%+d since %s)' % (count - prev['reviews'], prev['date'])
+    unreplied = sum(1 for r in rows if not r.get('owner_answer'))
+    lines = ['Google Maps, %dx%d grid %s km apart around the office:' % (cfg['grid']['size'], cfg['grid']['size'], cfg['grid']['spacing_km'])]
+    lines += [grid_line(kw, g, (prev or {}).get('grids', {}).get(kw)) for kw, g in grids.items()]
+    lines += ['', line + '. %d of the newest %d reviews have no owner reply.' % (unreplied, len(rows))]
+    acts = actions(b['site_domain'], profile, rows, today, cfg['low_rating'], cfg['unreplied_window_days'])
+    link = 'https://maps.google.com/?cid=%s' % b['cid']
+    c = card(b, lines, acts, link)
+    text = '\n'.join(['%s - Google Maps check (%s)' % (b['name'], b['site_domain'])] + lines + (['', 'Needs Leo:'] + acts if acts else []) + [link])
+    rec = {'date': today.isoformat(), 'slug': b['slug'], 'rating': rating, 'reviews': count, 'unreplied': unreplied,
+           'website': profile.get('domain'), 'actions': acts,
+           'grids': {kw: dict(g['summary'], date=today.isoformat(), top1_office=next((p.get('topResult') or {}).get('title') for p in g['grid'] if p['row'] == p['col'] == 1))
+                     for kw, g in grids.items()}}
+    open(os.path.join(D, 'latest-%s.md' % b['slug']), 'w').write(text + '\n')
+    if dry:
+        print(text)
+        return rec
+    hook = json.load(open(HOOKS))['site_lark_webhooks'].get(b['slug'])
+    if not hook or not (post(hook, {'msg_type': 'interactive', 'card': c}) or post(hook, {'msg_type': 'text', 'content': {'text': text}})):
+        print('lark: nothing delivered for', b['slug'], file=sys.stderr)
+    return rec
+
+
+def selftest():
+    today = datetime.date(2026, 10, 6)
+    rows = [{'timestamp': '2026-09-01 00:00:00 +00:00', 'rating': {'value': 1}, 'review_text': 'Late  and\nrude', 'owner_answer': None},
+            {'timestamp': '2026-09-02 00:00:00 +00:00', 'rating': {'value': 2}, 'review_text': 'x', 'owner_answer': 'Sorry'},
+            {'timestamp': '2026-09-03 00:00:00 +00:00', 'rating': {'value': 5}, 'review_text': 'great', 'owner_answer': None},
+            {'timestamp': '2025-01-01 00:00:00 +00:00', 'rating': {'value': 1}, 'review_text': 'old', 'owner_answer': None}]
+    a = actions('cleaningco.example', {'domain': 'catalystoutsourcing.com', 'is_claimed': True}, rows, today)
+    assert a[0].startswith('Profile website is catalystoutsourcing.com'), a
+    assert a[1].startswith('1 review of 3 stars'), a  # replied, 5-star and too-old reviews are not flagged
+    assert a[2] == '  2026-09-01, 1 star: "Late and rude"', a
+    assert actions('x.sg', {'domain': 'www.x.sg', 'is_claimed': True}, [], today) == []
+    assert 'not claimed' in actions('x.sg', {'domain': 'x.sg', 'is_claimed': False}, [], today)[0]
+    g = {'summary': {'top3Count': 6, 'pointsSearched': 9, 'pointsFound': 8, 'averageRank': 3.13},
+         'grid': [{'row': 1, 'col': 1, 'topResult': {'title': 'VepCo'}}]}
+    assert grid_line('vep', g, {'top3Count': 4, 'date': '2026-09-01'}).endswith('(+2 top-3 points since 2026-09-01)')
+    assert '(' not in grid_line('vep', g, {'top3Count': 6, 'date': '2026-09-01'})
+    print('selftest ok')
+
+
+def main(argv):
+    if '--selftest' in argv:
+        return selftest()
+    dry, only = '--dry-run' in argv, (argv[argv.index('--only') + 1] if '--only' in argv else None)
+    cfg = json.load(open(os.path.join(D, 'config.json')))
+    hist_f, prev = os.path.join(D, 'history.jsonl'), {}
+    if os.path.exists(hist_f):
+        for line in open(hist_f):
+            r = json.loads(line)
+            prev[r['slug']] = r
+    done = 0
+    for b in cfg['businesses']:
+        if only and b['slug'] != only:
+            continue
+        try:
+            rec = run(b, cfg, prev.get(b['slug']), dry)
+        except Exception as e:  # OpenSEO down (colima off) or a DataForSEO refusal: say so, keep going
+            print('ERR', b['slug'], e, file=sys.stderr)
+            subprocess.run(['osascript', '-e', 'display notification "%s" with title "local-maps-watch failed"' % str(e)[:150].replace('"', "'")], check=False)
+            continue
+        if not dry:
+            with open(hist_f, 'a') as fh:
+                fh.write(json.dumps(rec) + '\n')
+        done += 1
+    if done and not dry:  # sign of life for automation-health
+        os.makedirs(STATE, exist_ok=True)
+        open(os.path.join(STATE, 'last-ok'), 'w').write(datetime.date.today().isoformat() + '\n')
+    return 0 if done else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

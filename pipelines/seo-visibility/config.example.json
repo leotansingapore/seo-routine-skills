@@ -1,0 +1,68 @@
+{
+  "installed_at": "2026-09-14",
+  "max_parallel": 3,
+  "min_free_gb": 4,
+  "implement": {
+    "enabled": true,
+    "max_items": 6,
+    "max_per_week": 5,
+    "max_per_day": 3
+  },
+  "auto_approve": {
+    "severities": [
+      "P0",
+      "P1",
+      "P2"
+    ],
+    "evidence_status": [
+      "verified"
+    ],
+    "confidence": [
+      "high"
+    ],
+    "surface": [
+      "repo"
+    ],
+    "risk": [
+      "low"
+    ]
+  },
+  "digest": {
+    "weekday": 0,
+    "hour": 16
+  },
+  "lark_webhook": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+  "site_lark_webhooks": {
+    "vepco": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "dma": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "cleaningco": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "catalyst": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "financeblog": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "immigration": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "parentingblog": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "paintingco": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "searchblueprint": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "examprep": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>",
+    "internshipsite": "https://open.larksuite.com/open-apis/bot/v2/hook/<YOUR-WEBHOOK-ID>"
+  },
+  "site_weekday": {
+    "financeblog": 5,
+    "immigration": 1,
+    "parentingblog": 2,
+    "paintingco": 3,
+    "examprep": 4,
+    "internshipsite": 5,
+    "searchblueprint": 6,
+    "activitytracker": 6
+  },
+  "quarterly_weekday": {
+    "financeblog": 6,
+    "immigration": 5,
+    "parentingblog": 6,
+    "paintingco": 5,
+    "examprep": 6,
+    "internshipsite": 5,
+    "searchblueprint": 5,
+    "activitytracker": 6
+  }
+}

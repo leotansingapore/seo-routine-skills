@@ -1,0 +1,6 @@
+#!/bin/zsh
+# Weekly internal-linking refresh across the public sites. Driver: ~/.local/share/internal-linking/pipeline/weekly.py
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+export JEV_CACHE="$HOME/.local/share/internal-linking/jevcache"
+[ -f "$HOME/.zshenv" ] && source "$HOME/.zshenv"
+exec "$HOME/.local/share/uv/tools/scrapling/bin/python" "$HOME/.local/share/internal-linking/pipeline/weekly.py" "$@"

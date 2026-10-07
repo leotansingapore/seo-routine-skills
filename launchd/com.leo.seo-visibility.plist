@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/you/.local/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.leo.seo-visibility</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/you/.local/bin/seo-visibility</string>
+		<string>dispatch</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/you/Documents/seo-visibility/logs/launchd.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/you/Documents/seo-visibility/logs/launchd.out.log</string>
+	<key>StartInterval</key>
+	<integer>900</integer>
+</dict>
+</plist>

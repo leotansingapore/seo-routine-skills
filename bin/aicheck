@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""aicheck - deterministic AI-writing detector.
+
+Source of truth: ~/.claude/skills/anti-ai-writing/references/banned-patterns.md
+Usage:  aicheck FILE [FILE...]      aicheck -    (stdin)
+        aicheck FILE --json         aicheck FILE --raw  (score quoted spans too)
+Exit:   0 = pass (score < 15), 1 = fail
+"""
+import sys, re, os, json, collections, time
+
+BP = os.path.expanduser(
+    "~/.claude/skills/anti-ai-writing/references/banned-patterns.md")
+
+HARD_SECTIONS = {
+    "Absolute Ban", "Significance and Legacy Phrases", "Puffery Phrases",
+    "AI Transition Phrases", "AI Conclusion Phrases", "Hedging Phrases",
+    "Chatbot Remnants", "Vague Attribution Phrases",
+    "Negative Parallelism Phrases",
+}
+SOFT_SECTIONS = {"Contextual Ban"}
+
+
+# Words the list bans in ONE sense. The author wrote the sense beside each one
+# ("navigate (figurative)", "key (as adjective)", "unlock (figurative)"), and until
+# 2026-09-22 the loader threw that bracket away, so "navigate to Settings", "API
+# key", "rich text" and "test harness" all failed the gate. Absolute Ban words whose
+# annotation names a sense, plus every Contextual Ban word, get a second reading
+# from Jev (see excuse_literal); the rest of the list stays unconditional.
+SENSE_COND = {}
+
+
+def load_lists():
+    hard, soft = {}, {}
+    if not os.path.exists(BP):
+        return hard, soft
+    sec = ""
+    for line in open(BP, encoding="utf-8"):
+        m = re.match(r"^#{2,3}\s+(?:\d+\.\s*)?(.+?)\s*(?:\(.*\))?\s*$", line)
+        if m and line.startswith("#"):
+            sec = m.group(1).strip()
+            continue
+        if not line.startswith("- "):
+            continue
+        item = line[2:].strip()
+        ann = re.search(r"\((.*)\)", item)
+        sense = None
+        if sec == "Contextual Ban":
+            sense = (ann.group(1) if ann else "figurative or filler use")
+        elif sec == "Absolute Ban" and ann and re.match(r"(figurative|as |when |unless |meaning|the )", ann.group(1)):
+            sense = ann.group(1)
+        item = re.sub(r"\(.*?\)", " ", item)          # drop annotations
+        item = re.sub(r"\[.*?\]", " ", item)          # drop [alt/alt] tails
+        item = item.replace("—", " ").replace("–", " ")
+        bucket = hard if sec in HARD_SECTIONS else (
+            soft if sec in SOFT_SECTIONS else None)
+        if bucket is None:
+            continue
+        for variant in item.split(" / "):
+            v = " ".join(variant.split()).strip(" ,.\"'")
+            if len(v) < 3:
+                continue
+            bucket.setdefault(v.lower(), sec)
+            if sense:
+                SENSE_COND.setdefault(v.lower(), sense.replace("\u2014", "-").strip())
+    return hard, soft
+
+
+def strip_code(t, raw=False):
+    t = re.sub(r"```.*?```", " ", t, flags=re.S)
+    t = re.sub(r"`[^`\n]+`", " ", t)
+    if raw:
+        return t
+    # A term inside quotation marks is being CITED, not used - by a style guide
+    # listing what to avoid, or by copy quoting a real customer. Either way it is
+    # not the writer's own voice. Use --raw to score quoted spans too.
+    t = re.sub(r"[\u201c\u201d\"][^\"\u201c\u201d\n]{0,200}?[\u201c\u201d\"]", " ", t)
+    t = re.sub(r"\u00ab[^\u00bb\n]{0,200}?\u00bb", " ", t)
+    return t
+
+
+def is_spec_doc(t):
+    """SKILL.md / style-guide files legitimately enumerate banned terms."""
+    head = t[:400]
+    if re.match(r"^---\s*\nname:\s*\S", head) and "description:" in head:
+        return True
+    bullets = re.findall(r"^\s*[-*+]\s+(.{1,60})$", t, re.M)
+    if len(bullets) > 25:
+        bare = sum(1 for b in bullets
+                   if len(b.split()) <= 5 and not b.rstrip().endswith((".", "!", "?")))
+        if bare / len(bullets) > 0.6:
+            return True
+    return False
+
+
+def sentences(t):
+    t = re.sub(r"^\s*(#{1,6}|[-*+]|\d+\.)\s+", "", t, flags=re.M)
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z\"'(])|\n{2,}", t)
+    return [s.strip() for s in parts if len(s.strip()) > 1]
+
+
+def clauses(s):
+    """Rough clause count: finite-verb groups + subordinators."""
+    n = 1
+    n += len(re.findall(
+        r"\b(and|but|or|so|because|although|though|while|when|if|since|"
+        r"after|before|unless|whereas|that|which|who)\b\s+\w+\s+\w", s, re.I))
+    return min(n, 5)
+
+
+def bucket(s):
+    c = clauses(s)
+    w = len(s.split())
+    if w <= 5 and not re.search(r"\b(is|are|was|were|has|have|do|does|did)\b", s, re.I):
+        return "frag"
+    return {1: "short", 2: "med", 3: "long"}.get(c, "vlong")
+
+
+CHECKS = []
+def check(name, weight):
+    def deco(fn):
+        CHECKS.append((name, weight, fn)); return fn
+    return deco
+
+
+@check("em-dash density", 8)
+def c_emdash(t, w, sents):
+    n = t.count("—")
+    if not n: return []
+    per500 = n / max(w, 1) * 500
+    if per500 > 1.6:
+        return [f"{n} em dashes ({per500:.1f} per 500 words; limit 1.6)"]
+    return []
+
+
+@check("negative parallelism", 10)
+def c_negpar(t, w, sents):
+    pats = [r"\bnot just\b[^.!?]{0,60}\bbut\b", r"\bit'?s not (?:about|just)\b[^.!?]{0,60}\b(?:it'?s|but)\b",
+            r"\bnot (?:merely|simply|only)\b[^.!?]{0,60}\bbut\b",
+            r"\bisn'?t (?:about|just)\b[^.!?]{0,60}\bit'?s\b"]
+    return [f'"{m.group(0)[:70]}"' for p in pats for m in re.finditer(p, t, re.I)]
+
+
+@check("-ing closer", 8)
+def c_ing(t, w, sents):
+    out = []
+    for s in sents:
+        m = re.search(r",\s+(\w+ing)\b[^,.!?]*[.!?]?$", s)
+        if m and m.group(1).lower() not in ("nothing", "something", "anything", "everything", "during", "morning", "evening"):
+            out.append(f'"...{s[-60:].strip()}"')
+    return out
+
+
+@check("copula dodge", 6)
+def c_copula(t, w, sents):
+    pats = r"\b(serves as|stands as|represents a|marks a|boasts|showcases|exemplifies|constitutes a|functions as)\b"
+    return [m.group(0) for m in re.finditer(pats, t, re.I)]
+
+
+@check("Title Case heading", 5)
+def c_title(t, w, sents):
+    out = []
+    for line in t.splitlines():
+        m = re.match(r"^#{1,6}\s+(.+)$", line)
+        if not m: continue
+        words = [x for x in re.findall(r"[A-Za-z][A-Za-z'-]+", m.group(1))]
+        if len(words) < 3: continue
+        minor = {"a","an","the","and","or","but","for","to","of","in","on","at","with","from","by","as","is"}
+        cand = [x for x in words[1:] if x.lower() not in minor]
+        if cand and all(x[0].isupper() for x in cand):
+            out.append(m.group(1)[:60])
+    return out
+
+
+@check("inline-header bullets", 6)
+def c_inline(t, w, sents):
+    n = len(re.findall(r"^\s*[-*+]\s+\*\*[^*]+\*\*\s*[:—-]", t, re.M))
+    return [f"{n} bullets shaped `- **Header:** text`"] if n >= 2 else []
+
+
+@check("rule of three", 4)
+def c_three(t, w, sents):
+    runs, cur = [], 0
+    for line in t.splitlines():
+        if re.match(r"^\s*[-*+]\s+\S", line): cur += 1
+        else:
+            if cur == 3: runs.append(cur)
+            cur = 0
+    if cur == 3: runs.append(cur)
+    triads = len(re.findall(r"\b\w+, \w+,? and \w+\b", t))
+    out = []
+    if len(runs) >= 2: out.append(f"{len(runs)} lists with exactly 3 items")
+    if triads >= 3: out.append(f"{triads} 'X, Y, and Z' triads")
+    return out
+
+
+@check("summary conclusion", 7)
+def c_concl(t, w, sents):
+    tail = "\n".join(t.strip().splitlines()[-14:])
+    pats = r"^\s*#{0,6}\s*(In (summary|conclusion|closing)|Overall|To (summari[sz]e|sum up|recap)|The bottom line|Final thoughts|Key takeaways?)\b"
+    return [m.group(1) for m in re.finditer(pats, tail, re.I | re.M)]
+
+
+@check("despite/challenges pattern", 9)
+def c_despite(t, w, sents):
+    pats = [r"\bDespite (its|these|the)\b[^.!?]{0,80}\b(challenge|criticism|limitation|concern)",
+            r"\bfaces? (several|a number of|various|numerous) (challenges|obstacles|hurdles)\b",
+            r"\b(challenges|limitations) and (future|opportunities)\b",
+            r"\blooking (ahead|forward)\b[^.!?]{0,40}\b(future|continue|evolve)"]
+    return [m.group(0)[:70] for p in pats for m in re.finditer(p, t, re.I)]
+
+
+@check("emoji", 6)
+def c_emoji(t, w, sents):
+    e = re.findall("[\U0001F300-\U0001FAFF☀-➿⬀-⯿]", t)
+    return [f"{len(e)} emoji: {''.join(dict.fromkeys(e))[:12]}"] if e else []
+
+
+@check("boldface density", 4)
+def c_bold(t, w, sents):
+    n = len(re.findall(r"\*\*[^*\n]{2,80}\*\*", t))
+    per500 = n / max(w, 1) * 500
+    return [f"{n} bold spans ({per500:.1f} per 500 words; limit 3)"] if per500 > 3 else []
+
+
+@check("monotone rhythm", 9)
+def c_rhythm(t, w, sents):
+    if len(sents) < 6: return []
+    b = [bucket(s) for s in sents]
+    out, run, i = [], 1, 1
+    while i < len(b):
+        run = run + 1 if b[i] == b[i-1] else 1
+        if run == 4:
+            out.append(f'4+ consecutive "{b[i]}" sentences near: "{sents[i][:55]}..."')
+        i += 1
+    lens = [len(s.split()) for s in sents]
+    mean = sum(lens)/len(lens)
+    var = (sum((x-mean)**2 for x in lens)/len(lens)) ** .5
+    if var < 5.5:
+        out.append(f"sentence-length stdev {var:.1f} (human prose is >7; metronome rhythm)")
+    return out
+
+
+@check("vague attribution", 7)
+def c_vague(t, w, sents):
+    pats = r"\b(experts (say|agree|note)|industry (observers|analysts)|critics argue|studies (show|suggest)|research (shows|suggests|indicates)|it is (widely )?(believed|considered)|many (believe|argue)|some (argue|say))\b"
+    return [m.group(0) for m in re.finditer(pats, t, re.I)]
+
+
+@check("hedge stack", 5)
+def c_hedge(t, w, sents):
+    pats = r"\b(can help to|may potentially|could potentially|might possibly|often tends to|generally speaking|in many cases|to some extent|arguably one of)\b"
+    return [m.group(0) for m in re.finditer(pats, t, re.I)]
+
+
+
+# ---------------------------------------------------------------------------
+# Performance register: copy that is trying to be admired rather than read.
+# Zero banned vocabulary, zero AI structures, and still wrong. This is the
+# copywriter-performing voice: setup-then-punch rhythm, contrast flips,
+# aphoristic closers. Density-based so length does not skew it.
+# ---------------------------------------------------------------------------
+
+def _sent_words(s):
+    return len(s.split())
+
+
+@check("setup-punch rhythm", 12)
+def c_punch(t, w, sents):
+    """A long sentence followed by a very short one, purely for emphasis.
+    A short sentence carrying a number or a name is a fact, not a punch."""
+    out = []
+    pairs = []
+    for para in re.split(r"\n\s*\n", t):
+        ss = sentences(para)
+        pairs += [(ss[i - 1], ss[i]) for i in range(1, len(ss))]
+    for prev, cur in pairs:
+        if len(prev.split()) < 18 or len(cur.split()) > 6:
+            continue
+        if not cur.rstrip().endswith("."):
+            continue
+        if re.search(r"\d", cur):
+            continue
+        if re.match(r"^(See|Read|Send|Book|Contact|Ask|Check|Call|Start|Get|Message|Renew)\b", cur, re.I):
+            continue
+        out.append(f'"...{prev[-40:].strip()}" -> "{cur.strip()}"')
+    return out[:5] if len(out) >= 2 and len(out) / max(w, 1) * 500 > 0.4 else []
+
+
+@check("contrast flip", 12)
+def c_flip(t, w, sents):
+    """Rhetorical pivots only. A factual correction ('not the date approved')
+    is content; 'not the front' is performance."""
+    out = []
+    for m in re.finditer(r"\bnot (?:just|merely|simply|only)\b[^.!?]{0,50}?\bbut\b", t, re.I):
+        out.append(m.group(0).strip()[:60])
+    for m in re.finditer(r"\bit'?s not\b[^.!?]{0,40}?\bit'?s\b", t, re.I):
+        out.append(m.group(0).strip()[:60])
+    # bare ", not X." where X is short and abstract: no number, no proper noun
+    for m in re.finditer(r",\s+not\s+([^.!?]{2,28})[.!?]", t):
+        tail = m.group(1).strip()
+        if len(tail.split()) > 4 or re.search(r"\d", tail):
+            continue
+        if re.search(r"\b[A-Z][a-z]{2,}", tail):
+            continue
+        out.append(f'", not {tail}."')
+    return out[:5] if len(out) / max(w, 1) * 500 > 0.5 else []
+
+
+@check("aphoristic closer", 11)
+def c_aphorism(t, w, sents):
+    """A short copula generalisation used as a mic-drop. Instructions and
+    questions are not aphorisms, however short."""
+    out = []
+    for para in re.split(r"\n\s*\n", t):
+        ss = sentences(para)
+        if len(ss) < 2:
+            continue
+        last = ss[-1].strip()
+        if last.endswith("?") or not (2 <= len(last.split()) <= 6):
+            continue
+        if re.search(r"\d", last) or re.search(r"\s[A-Z][a-z]{2,}", last):
+            continue
+        # must be a linking assertion: "Those weeks are real", "That is the point"
+        if not re.match(r"^(That|This|These|Those|It|They|Both|Either)\b[^.]{0,40}\b(is|are|was|were)\b", last, re.I):
+            continue
+        out.append(f'"{last}"')
+    return out[:5] if out else []
+
+
+@check("anaphora", 5)
+def c_anaphora(t, w, sents):
+    """Consecutive sentences opening with the same two words."""
+    out = []
+    for i in range(1, len(sents)):
+        a = " ".join(sents[i - 1].split()[:2]).lower().strip(".,")
+        b = " ".join(sents[i].split()[:2]).lower().strip(".,")
+        if a and a == b and len(a) > 4:
+            out.append(f'"{a}..." twice in a row')
+    return out[:4] if len(out) >= 3 else []
+
+
+@check("meta-statement", 12)
+def c_meta(t, w, sents):
+    """Copy commenting on its own cleverness."""
+    pats = (r"\b(that'?s the (whole|entire|real|only) \w+|that is the point|"
+            r"here'?s the thing|the truth is|that'?s the trick|which is the "
+            r"(detail|part|bit) that|the part (people|nobody) \w+)\b")
+    return [m.group(0)[:60] for m in re.finditer(pats, t, re.I)]
+
+# ---------------------------------------------------------------------------
+# A word list cannot tell "navigate to Settings" from "navigate the challenges".
+# Jev (TypeSafe, pinned) reads each hit on a sense-conditioned word in its own
+# sentence and answers whether it carries the banned sense. Measured 2026-09-22 on
+# 103 real hits from shipped changelogs and docs plus 35 figurative controls: every
+# hit at or below 0.24 was a literal use (81 of the 103 were - the list's false
+# positives), every control scored 0.35 or higher (median 0.91). At 0.25 the veto
+# excuses 72 of the 81 literal hits, 0 banned-sense hits and 0 controls. A missing
+# key, a timeout or any error keeps the hit, which is exactly what the check did
+# before Jev; AICHECK_NO_JEV=1 turns the reading off for a hermetic run.
+# ---------------------------------------------------------------------------
+JEV_MODEL = "jev-1.13.0"
+JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+JEV_LITERAL = 0.25     # at or below: the word is used literally, the hit is excused
+JEV_BUDGET_S = 8       # the PostToolUse hook kills aicheck at 15s
+JEV_MAX_ASKS = 40
+SENSE_Q = {
+    "type": "noul",
+    "instructions": "In `sentence`, is the word `word` used in the sense described in `banned_sense`, rather than in a literal, concrete sense?",
+    "criteria": {
+        "true": "It carries the figurative, decorative or filler meaning the rule describes: it could be cut or swapped for a plainer word without changing what the sentence says about the world.",
+        "false": "It names a real thing, place, action or property: a key that opens or identifies something, moving to a page or place, a text editor with formatting, a test harness, an item that becomes available, a real landscape, a real craft, a statistic that is significant, a person who actually holds a stake. Removing it would change the facts.",
+    },
+}
+
+
+def _jev_key():
+    if os.environ.get("AICHECK_NO_JEV"):
+        return ""
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if key:
+        return key
+    try:
+        import subprocess
+        out = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "typesafe-api-key", "-w"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _jev_banned_sense(key, sentence, word, sense, timeout):
+    """Probability the word is used in the banned sense, or None when Jev did not answer."""
+    import urllib.request
+    body = json.dumps({"model": JEV_MODEL,
+                       "state": {"sentence": sentence[:400], "word": word, "banned_sense": sense},
+                       "questions": {"q": SENSE_Q}}).encode()
+    req = urllib.request.Request(JEV_ENDPOINT, data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return float(json.loads(res.read().decode())["answers"]["q"]["noul"])
+    except Exception:
+        return None
+
+
+def excuse_literal(sents, hits):
+    """Drop the hits on sense-conditioned words that Jev reads as literal.
+
+    Returns (kept, excused): two Counters. Every occurrence Jev does not answer about
+    is kept, so a silent Jev changes nothing.
+    """
+    kept, excused = collections.Counter(hits), collections.Counter()
+    asks = []
+    for term in hits:
+        sense = SENSE_COND.get(term)
+        if not sense:
+            continue
+        pat = r"\b" + re.escape(term).replace(r"\ ", r"\s+") + (r"\b" if term[-1].isalnum() else "")
+        for s in sents:
+            for _ in re.finditer(pat, s.lower()):
+                asks.append((term, " ".join(s.split()), sense))
+    key = _jev_key() if asks else ""
+    if not key:
+        return kept, excused
+    asks = asks[:JEV_MAX_ASKS]
+    import concurrent.futures
+    pool = concurrent.futures.ThreadPoolExecutor(5)
+    futs = {pool.submit(_jev_banned_sense, key, s, term, sense, JEV_BUDGET_S): term for term, s, sense in asks}
+    try:
+        # Past the budget, whatever is still in flight is simply kept: the hook kills
+        # the whole check at 15s, and a late excuse is worth less than a report.
+        for f in concurrent.futures.as_completed(futs, timeout=JEV_BUDGET_S):
+            try:
+                p = f.result()
+            except Exception:
+                p = None
+            if p is not None and p <= JEV_LITERAL and kept[futs[f]] > 0:
+                kept[futs[f]] -= 1
+                excused[futs[f]] += 1
+    except concurrent.futures.TimeoutError:
+        pass
+    finally:
+        pool.shutdown(wait=False)
+    return collections.Counter({k: v for k, v in kept.items() if v > 0}), excused
+
+
+def scan_lexicon(t, lex):
+    hits = collections.Counter()
+    low = t.lower()
+    for term in lex:
+        pat = r"\b" + re.escape(term).replace(r"\ ", r"\s+") + (r"\b" if term[-1].isalnum() else "")
+        n = len(re.findall(pat, low))
+        if n: hits[term] = n
+    return hits
+
+
+def analyze(text, name="<stdin>", raw=False):
+    spec = is_spec_doc(text)
+    t = strip_code(text, raw)
+    words = len(t.split())
+    sents = sentences(t)
+    hard, soft = load_lists()
+    hardhits = scan_lexicon(t, hard)
+    softhits = scan_lexicon(t, soft)
+    excused = collections.Counter()
+    if not spec:
+        hardhits, ex = excuse_literal(sents, hardhits); excused += ex
+        softhits, ex = excuse_literal(sents, softhits); excused += ex
+
+    findings = []
+    score = 0
+    if excused:
+        findings.append(("excused as literal (Jev)", 0,
+                         [", ".join(f"{k}\u00d7{v}" if v > 1 else k for k, v in excused.most_common(12))]))
+
+    nh = sum(hardhits.values())
+    if nh:
+        per500 = nh / max(words, 1) * 500
+        pts = min(40, round(per500 * 7))
+        score += pts
+        top = ", ".join(f"{k}×{v}" if v > 1 else k
+                        for k, v in hardhits.most_common(12))
+        findings.append(("banned vocabulary", pts,
+                         [f"{nh} hits ({per500:.1f}/500w): {top}"]))
+
+    for nm, wt, fn in CHECKS:
+        try: hits = fn(t, words, sents)
+        except Exception: hits = []
+        if hits:
+            pts = min(wt, wt if len(hits) > 2 else max(2, wt // 2))
+            score += pts
+            findings.append((nm, pts, hits[:6]))
+
+    ns = sum(softhits.values())
+    if ns:
+        per500 = ns / max(words, 1) * 500
+        if per500 > 2:
+            pts = min(8, round(per500))
+            score += pts
+            findings.append(("contextual-ban words", pts,
+                             [", ".join(f"{k}×{v}" for k, v in softhits.most_common(8))]))
+
+    score = min(100, score)
+    verdict = ("HUMAN" if score < 15 else "SUSPECT" if score < 35
+               else "AI-FLAVORED" if score < 60 else "MACHINE")
+    return dict(file=name, words=words, sentences=len(sents),
+                score=score, verdict=verdict, spec_doc=spec, excused=dict(excused),
+                findings=[dict(check=c, points=p, hits=h) for c, p, h in findings])
+
+
+def render(r):
+    bar = "#" * (r["score"] // 4) + "." * (25 - r["score"] // 4)
+    print(f"\n{r['file']}  [{r['words']}w / {r['sentences']} sentences]")
+    print(f"  AI SCORE {r['score']:>3}/100  [{bar}]  {r['verdict']}")
+    if r.get("spec_doc"):
+        print("  NOTE: looks like a spec/style-guide file that enumerates banned")
+        print("        terms on purpose. Score is not meaningful here. Run aicheck")
+        print("        on finished copy, not on the rules about copy.")
+    if not r["findings"]:
+        print("  clean - no detectable AI fingerprints\n"); return
+    print()
+    for f in sorted(r["findings"], key=lambda x: -x["points"]):
+        print(f"  [{f['points']:>2}] {f['check']}")
+        for h in f["hits"]:
+            print(f"        - {h}")
+    print(f"\n  target: score < 15. Currently {r['score']}.\n")
+
+
+def main():
+    a = [x for x in sys.argv[1:] if not x.startswith("--")]
+    as_json = "--json" in sys.argv
+    raw = "--raw" in sys.argv
+    if not a:
+        print(__doc__); sys.exit(2)
+    results = []
+    for p in a:
+        if p == "-":
+            results.append(analyze(sys.stdin.read(), "<stdin>", raw))
+        else:
+            results.append(analyze(open(p, encoding="utf-8").read(),
+                                   os.path.basename(p), raw))
+    if as_json:
+        print(json.dumps(results if len(results) > 1 else results[0], indent=2))
+    else:
+        for r in results: render(r)
+    sys.exit(0 if all(r["score"] < 15 or r.get("spec_doc") for r in results) else 1)
+
+
+if __name__ == "__main__":
+    main()

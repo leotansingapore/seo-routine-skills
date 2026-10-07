@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Weekly Singapore Google ranks for DMA's AI pages (built 2026-09-27). Top 30 per keyword via DataForSEO (~$0.10 a run).
+Appends to ~/.local/share/dma-perf/rank-watch/history.jsonl, writes latest.md, and sends one macOS notification
+when a page first appears or moves 3+ places. Keywords and target pages: keywords.json beside it."""
+import base64, json, os, subprocess, sys, time, urllib.request
+D = os.path.expanduser('~/.local/share/dma-perf/rank-watch'); KW = json.load(open(os.path.join(D, 'keywords.json')))
+env = {}
+for line in open(os.path.expanduser('~/.config/dma-rank-watch/dataforseo.env')):
+    if '=' in line and not line.lstrip().startswith('#'): k, v = line.strip().split('=', 1); env[k] = v.strip().strip('"')
+auth = base64.b64encode(f"{env['DATAFORSEO_LOGIN']}:{env['DATAFORSEO_PASSWORD']}".encode()).decode()
+hist_f = os.path.join(D, 'history.jsonl')
+prev = {}
+if os.path.exists(hist_f):
+    for line in open(hist_f): r = json.loads(line); prev[r['kw']] = r
+now, rows, moves, cost = time.strftime('%Y-%m-%d'), [], [], 0.0
+for kw, page in KW.items():
+    body = [{'keyword': kw, 'location_code': 2702, 'language_code': 'en', 'depth': 30}]
+    req = urllib.request.Request('https://api.dataforseo.com/v3/serp/google/organic/live/advanced', data=json.dumps(body).encode(), headers={'Authorization': 'Basic ' + auth, 'Content-Type': 'application/json'})
+    try: t = json.load(urllib.request.urlopen(req, timeout=120))['tasks'][0]
+    except Exception as e: print('ERR', kw, e, file=sys.stderr); continue
+    cost += t.get('cost') or 0
+    items = [i for i in (t['result'][0]['items'] or []) if i['type'] == 'organic']
+    pos = next((i['rank_group'] for i in items if 'digitalmarketingagency.sg' in (i.get('url') or '') and i['url'].rstrip('/').endswith(page)), None)
+    anyp = next(((i['rank_group'], i['url']) for i in items if 'digitalmarketingagency.sg' in (i.get('url') or '')), None)
+    r = {'date': now, 'kw': kw, 'page': page, 'pos': pos, 'best_dma': anyp}; rows.append(r)
+    p0 = prev.get(kw, {}).get('pos')
+    if pos and (p0 is None or abs(p0 - pos) >= 3): moves.append(f"{kw}: {p0 or '-'} -> {pos}")
+    if p0 and not pos: moves.append(f"{kw}: {p0} -> out of top 30")
+with open(hist_f, 'a') as fh:
+    for r in rows: fh.write(json.dumps(r) + '\n')
+md = [f'# DMA AI pages, Google Singapore ranks, {now}', '', f'Cost ${cost:.3f}', '', '| Keyword | Target page | Position | Best DMA result |', '|---|---|---|---|']
+md += [f"| {r['kw']} | {r['page']} | {r['pos'] or '-'} | {(str(r['best_dma'][0]) + ' ' + r['best_dma'][1].split('.sg')[-1]) if r['best_dma'] else '-'} |" for r in rows]
+md += ['', 'Moves: ' + ('; '.join(moves) if moves else 'none')]
+open(os.path.join(D, 'latest.md'), 'w').write('\n'.join(md) + '\n'); print('\n'.join(md))
+if moves:
+    msg = ('; '.join(moves))[:200].replace('"', "'")
+    subprocess.run(['osascript', '-e', f'display notification "{msg}" with title "DMA rankings moved"'], check=False)
+
+if rows:  # sign of life for automation-health
+    os.makedirs(os.path.expanduser('~/.local/state/dma-rank-watch'), exist_ok=True); open(os.path.expanduser('~/.local/state/dma-rank-watch/last-ok'), 'w').write(time.strftime('%Y-%m-%d') + '\n')
